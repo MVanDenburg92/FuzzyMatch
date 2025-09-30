@@ -1,3 +1,6 @@
+streamlit==1.31.1
+pandas==2.1.4
+rapidfuzz==3.5.2
 streamlit==1.32.0
 pandas==2.2.1
 rapidfuzz==3.6.1

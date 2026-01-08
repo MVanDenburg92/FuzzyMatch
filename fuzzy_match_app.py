@@ -136,31 +136,50 @@ class FuzzyMatcher:
         
         return pd.DataFrame(results)
     
-    def fuzzy_match_two_columns(self,
-                                df1_name: str,
-                                df2_name: str,
-                                df1_col1: str,
-                                df1_col2: str,
-                                df2_col1: str,
-                                df2_col2: str,
-                                method: str = 'token_sort_ratio',
-                                weight_col1: float = 0.6,
-                                weight_col2: float = 0.4,
-                                require_both: bool = False) -> pd.DataFrame:
+    def fuzzy_match_flexible_columns(self,
+                                     df1_name: str,
+                                     df2_name: str,
+                                     df1_cols: List[str],
+                                     df2_cols: List[str],
+                                     method: str = 'token_sort_ratio',
+                                     weights: List[float] = None,
+                                     require_all: bool = False) -> pd.DataFrame:
         """
-        Perform fuzzy matching between two DataFrames using two columns from each.
+        Perform fuzzy matching between two DataFrames using flexible number of columns (1-5 from each).
         
         Parameters:
         - df1_name, df2_name: Names of the dataframes
-        - df1_col1, df1_col2: Column names from dataset 1
-        - df2_col1, df2_col2: Column names from dataset 2
+        - df1_cols: List of 1-5 column names from dataset 1
+        - df2_cols: List of 1-5 column names from dataset 2
         - method: Fuzzy matching method to use
-        - weight_col1: Weight for first column (0-1)
-        - weight_col2: Weight for second column (0-1)
-        - require_both: If True, both columns must match above threshold
+        - weights: List of weights for each column pair (will be normalized)
+        - require_all: If True, all columns must match above threshold
         """
         df1 = self.dataframes[df1_name].copy()
         df2 = self.dataframes[df2_name].copy()
+        
+        num_cols = max(len(df1_cols), len(df2_cols))
+        
+        # Pad shorter list with empty strings
+        while len(df1_cols) < num_cols:
+            df1_cols.append('')
+        while len(df2_cols) < num_cols:
+            df2_cols.append('')
+        
+        # Default weights if not provided
+        if weights is None or len(weights) == 0:
+            weights = [1.0] * num_cols
+        else:
+            # Pad weights if needed
+            while len(weights) < num_cols:
+                weights.append(0.0)
+        
+        # Normalize weights
+        total_weight = sum(weights)
+        if total_weight > 0:
+            weights = [w / total_weight for w in weights]
+        else:
+            weights = [1.0 / num_cols] * num_cols
         
         # Choose fuzzy matching method
         method_map = {
@@ -174,11 +193,13 @@ class FuzzyMatcher:
         
         results = []
         
-        # Clean data
-        df1[df1_col1] = df1[df1_col1].fillna('').astype(str)
-        df1[df1_col2] = df1[df1_col2].fillna('').astype(str)
-        df2[df2_col1] = df2[df2_col1].fillna('').astype(str)
-        df2[df2_col2] = df2[df2_col2].fillna('').astype(str)
+        # Clean data - only for non-empty columns
+        for col in df1_cols:
+            if col:
+                df1[col] = df1[col].fillna('').astype(str)
+        for col in df2_cols:
+            if col:
+                df2[col] = df2[col].fillna('').astype(str)
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -190,11 +211,16 @@ class FuzzyMatcher:
             progress_bar.progress(progress)
             status_text.text(f"Processing row {idx1 + 1} of {total_rows}...")
             
-            search_value1 = row1[df1_col1]
-            search_value2 = row1[df1_col2]
+            # Get search values (empty string for missing columns)
+            search_values = []
+            for col in df1_cols:
+                if col:
+                    search_values.append(row1[col])
+                else:
+                    search_values.append('')
             
-            # Skip if both values are empty
-            if search_value1.strip() == '' and search_value2.strip() == '':
+            # Skip if all values are empty
+            if all(val.strip() == '' for val in search_values):
                 continue
             
             best_score = 0
@@ -203,35 +229,49 @@ class FuzzyMatcher:
             
             # Compare against each row in df2
             for idx2, row2 in df2.iterrows():
-                match_value1 = row2[df2_col1]
-                match_value2 = row2[df2_col2]
-                
-                # Calculate scores for each column
-                score1 = 0
-                score2 = 0
-                
-                if search_value1.strip() != '' and match_value1.strip() != '':
-                    score1 = fuzzy_func(search_value1, match_value1)
-                
-                if search_value2.strip() != '' and match_value2.strip() != '':
-                    score2 = fuzzy_func(search_value2, match_value2)
-                
-                # Calculate combined score
-                if require_both:
-                    # Both columns must meet threshold
-                    if score1 >= self.threshold and score2 >= self.threshold:
-                        combined_score = (score1 * weight_col1) + (score2 * weight_col2)
+                match_values = []
+                for col in df2_cols:
+                    if col:
+                        match_values.append(row2[col])
                     else:
-                        combined_score = 0
+                        match_values.append('')
+                
+                # Calculate scores for each column pair
+                scores = []
+                valid_comparisons = 0
+                
+                for i in range(num_cols):
+                    # Only calculate score if both columns are specified and have values
+                    if (df1_cols[i] and df2_cols[i] and 
+                        search_values[i].strip() != '' and match_values[i].strip() != ''):
+                        score = fuzzy_func(search_values[i], match_values[i])
+                        scores.append(score)
+                        valid_comparisons += 1
+                    else:
+                        scores.append(0)
+                
+                # Calculate combined score only if we have valid comparisons
+                if valid_comparisons > 0:
+                    if require_all:
+                        # All specified columns must meet threshold
+                        valid_scores = [scores[i] for i in range(num_cols) 
+                                       if df1_cols[i] and df2_cols[i] and 
+                                       search_values[i].strip() != '' and match_values[i].strip() != '']
+                        if all(score >= self.threshold for score in valid_scores):
+                            combined_score = sum(scores[i] * weights[i] for i in range(num_cols))
+                        else:
+                            combined_score = 0
+                    else:
+                        # Use weighted average
+                        combined_score = sum(scores[i] * weights[i] for i in range(num_cols))
                 else:
-                    # Use weighted average
-                    combined_score = (score1 * weight_col1) + (score2 * weight_col2)
+                    combined_score = 0
                 
                 # Update best match if this is better
                 if combined_score > best_score:
                     best_score = combined_score
                     best_match_idx = idx2
-                    best_match_scores = (score1, score2)
+                    best_match_scores = scores
             
             # If we found a match above threshold, add it to results
             if best_score >= self.threshold and best_match_idx is not None:
@@ -240,23 +280,24 @@ class FuzzyMatcher:
                 result = {
                     f'{df1_name}_index': idx1,
                     f'{df2_name}_index': best_match_idx,
-                    'combined_score': round(best_score, 2),
-                    f'{df1_col1}_score': round(best_match_scores[0], 2),
-                    f'{df1_col2}_score': round(best_match_scores[1], 2),
-                    f'{df1_name}_{df1_col1}': search_value1,
-                    f'{df1_name}_{df1_col2}': search_value2,
-                    f'{df2_name}_{df2_col1}': matched_row[df2_col1],
-                    f'{df2_name}_{df2_col2}': matched_row[df2_col2]
+                    'combined_score': round(best_score, 2)
                 }
+                
+                # Add individual scores and matched values for specified columns
+                for i in range(num_cols):
+                    if df1_cols[i] and df2_cols[i]:
+                        result[f'col{i+1}_score'] = round(best_match_scores[i], 2)
+                        result[f'{df1_name}_{df1_cols[i]}'] = search_values[i]
+                        result[f'{df2_name}_{df2_cols[i]}'] = matched_row[df2_cols[i]]
                 
                 # Add remaining columns from df1
                 for col in df1.columns:
-                    if col not in [df1_col1, df1_col2]:
+                    if col not in [c for c in df1_cols if c]:
                         result[f'{df1_name}_{col}'] = row1[col]
                 
                 # Add remaining columns from df2
                 for col in df2.columns:
-                    if col not in [df2_col1, df2_col2]:
+                    if col not in [c for c in df2_cols if c]:
                         result[f'{df2_name}_{col}'] = matched_row[col]
                 
                 results.append(result)
@@ -265,6 +306,90 @@ class FuzzyMatcher:
         status_text.empty()
         
         return pd.DataFrame(results)
+    
+    def create_left_join(self, df1_name: str, df2_name: str, match_results: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create a left join: All records from dataset 1 with their matches from dataset 2.
+        Records without matches will have NaN for dataset 2 columns.
+        """
+        df1 = self.dataframes[df1_name].copy()
+        df2 = self.dataframes[df2_name].copy()
+        
+        # Add prefix to all df1 columns
+        df1_renamed = df1.add_prefix(f'{df1_name}_')
+        df1_renamed[f'{df1_name}_index'] = df1.index
+        
+        # Add prefix to all df2 columns
+        df2_renamed = df2.add_prefix(f'{df2_name}_')
+        df2_renamed[f'{df2_name}_index'] = df2.index
+        
+        # Create a simplified match lookup
+        if len(match_results) > 0:
+            match_lookup = match_results[[f'{df1_name}_index', f'{df2_name}_index', 'combined_score']].copy()
+            
+            # Merge df1 with match results
+            result = df1_renamed.merge(
+                match_lookup,
+                on=f'{df1_name}_index',
+                how='left'
+            )
+            
+            # Merge with df2 data
+            result = result.merge(
+                df2_renamed,
+                on=f'{df2_name}_index',
+                how='left'
+            )
+        else:
+            # No matches, just return df1 with empty df2 columns
+            result = df1_renamed.copy()
+            result['combined_score'] = None
+            for col in df2.columns:
+                result[f'{df2_name}_{col}'] = None
+        
+        return result
+    
+    def create_right_join(self, df1_name: str, df2_name: str, match_results: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create a right join: All records from dataset 2 with their matches from dataset 1.
+        Records without matches will have NaN for dataset 1 columns.
+        """
+        df1 = self.dataframes[df1_name].copy()
+        df2 = self.dataframes[df2_name].copy()
+        
+        # Add prefix to all df1 columns
+        df1_renamed = df1.add_prefix(f'{df1_name}_')
+        df1_renamed[f'{df1_name}_index'] = df1.index
+        
+        # Add prefix to all df2 columns
+        df2_renamed = df2.add_prefix(f'{df2_name}_')
+        df2_renamed[f'{df2_name}_index'] = df2.index
+        
+        # Create a simplified match lookup
+        if len(match_results) > 0:
+            match_lookup = match_results[[f'{df1_name}_index', f'{df2_name}_index', 'combined_score']].copy()
+            
+            # Merge df2 with match results
+            result = df2_renamed.merge(
+                match_lookup,
+                on=f'{df2_name}_index',
+                how='left'
+            )
+            
+            # Merge with df1 data
+            result = result.merge(
+                df1_renamed,
+                on=f'{df1_name}_index',
+                how='left'
+            )
+        else:
+            # No matches, just return df2 with empty df1 columns
+            result = df2_renamed.copy()
+            result['combined_score'] = None
+            for col in df1.columns:
+                result[f'{df1_name}_{col}'] = None
+        
+        return result
     
     def fuzzy_match_many_to_one(self,
                                  df1_name: str,
@@ -433,7 +558,7 @@ def main():
         
         match_type = st.radio(
             "Select Matching Type",
-            ["Single Column Match", "Two Column Match", "Multiple Columns to One"],
+            ["Single Column Match", "Multi-Column Match (1-5 columns)", "Multiple Columns to One"],
             horizontal=True
         )
         
@@ -462,6 +587,9 @@ def main():
                         method=matching_method
                     )
                     
+                    # Store results in session state
+                    st.session_state.match_results = results
+                    
                     if len(results) > 0:
                         st.success(f"✅ Found {len(results)} matches!")
                         
@@ -475,126 +603,231 @@ def main():
                         st.subheader("📊 Matching Results")
                         st.dataframe(results, use_container_width=True)
                         
-                        # Download button
-                        csv = results.to_csv(index=False)
-                        st.download_button(
-                            label="⬇️ Download Results as CSV",
-                            data=csv,
-                            file_name="fuzzy_match_results.csv",
-                            mime="text/csv"
-                        )
+                        # Download section
+                        st.subheader("⬇️ Download Options")
+                        
+                        download_cols = st.columns(3)
+                        
+                        with download_cols[0]:
+                            # Download matches only
+                            csv = results.to_csv(index=False)
+                            st.download_button(
+                                label="📄 Download Matches Only",
+                                data=csv,
+                                file_name="fuzzy_match_results.csv",
+                                mime="text/csv",
+                                help="Download only the matched records"
+                            )
+                        
+                        with download_cols[1]:
+                            # Left Join - All Dataset 1 + Matches from Dataset 2
+                            left_join = st.session_state.matcher.create_left_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_left = left_join.to_csv(index=False)
+                            st.download_button(
+                                label="⬅️ Left Join (All Dataset 1)",
+                                data=csv_left,
+                                file_name="left_join_all_dataset1_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 1 with matching records from Dataset 2"
+                            )
+                        
+                        with download_cols[2]:
+                            # Right Join - All Dataset 2 + Matches from Dataset 1
+                            right_join = st.session_state.matcher.create_right_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_right = right_join.to_csv(index=False)
+                            st.download_button(
+                                label="➡️ Right Join (All Dataset 2)",
+                                data=csv_right,
+                                file_name="right_join_all_dataset2_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 2 with matching records from Dataset 1"
+                            )
                     else:
                         st.warning("⚠️ No matches found above the threshold. Try lowering the threshold.")
         
-        elif match_type == "Two Column Match":
-            st.markdown("**Match two columns from each dataset (e.g., Address + Expiration Date)**")
+        elif match_type == "Multi-Column Match (1-5 columns)":
+            st.markdown("**Match using 1-5 columns from each dataset. Each dataset can have a different number of columns.**")
             
             col1, col2 = st.columns(2)
             
             with col1:
                 st.markdown("**Dataset 1 Columns**")
-                df1_col1 = st.selectbox(
-                    "First column from Dataset 1",
-                    options=df1.columns.tolist(),
-                    key="df1_col1"
+                num_cols_df1 = st.number_input(
+                    "Number of columns from Dataset 1",
+                    min_value=1,
+                    max_value=5,
+                    value=3,
+                    key="num_cols_df1"
                 )
-                df1_col2 = st.selectbox(
-                    "Second column from Dataset 1",
-                    options=df1.columns.tolist(),
-                    key="df1_col2"
-                )
+                
+                df1_cols = []
+                for i in range(int(num_cols_df1)):
+                    col = st.selectbox(
+                        f"Column {i+1} from Dataset 1",
+                        options=df1.columns.tolist(),
+                        key=f"df1_col{i}",
+                        help="Select a column to match"
+                    )
+                    df1_cols.append(col)
             
             with col2:
                 st.markdown("**Dataset 2 Columns**")
-                df2_col1 = st.selectbox(
-                    "First column from Dataset 2",
-                    options=df2.columns.tolist(),
-                    key="df2_col1"
+                num_cols_df2 = st.number_input(
+                    "Number of columns from Dataset 2",
+                    min_value=1,
+                    max_value=5,
+                    value=3,
+                    key="num_cols_df2"
                 )
-                df2_col2 = st.selectbox(
-                    "Second column from Dataset 2",
-                    options=df2.columns.tolist(),
-                    key="df2_col2"
-                )
+                
+                df2_cols = []
+                for i in range(int(num_cols_df2)):
+                    col = st.selectbox(
+                        f"Column {i+1} from Dataset 2",
+                        options=df2.columns.tolist(),
+                        key=f"df2_col{i}",
+                        help="Select a column to match"
+                    )
+                    df2_cols.append(col)
             
+            # Determine the maximum number of columns
+            max_cols = max(len(df1_cols), len(df2_cols))
+            
+            st.markdown("---")
             st.markdown("**Matching Parameters**")
-            col1, col2, col3 = st.columns(3)
             
-            with col1:
-                weight_col1 = st.slider(
-                    f"Weight for column 1",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.6,
-                    step=0.1,
-                    help="How much to weight the first column (0-1)"
-                )
+            # Show column pairing information
+            st.info(f"ℹ️ Dataset 1 has {len(df1_cols)} column(s), Dataset 2 has {len(df2_cols)} column(s). "
+                   f"Matching will compare up to {max_cols} column pair(s).")
             
-            with col2:
-                weight_col2 = st.slider(
-                    f"Weight for column 2",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.4,
-                    step=0.1,
-                    help="How much to weight the second column (0-1)"
-                )
+            # Create weight sliders for each column pair
+            st.markdown("**Column Weights** (adjust importance of each column pair)")
             
-            with col3:
-                require_both = st.checkbox(
-                    "Require both columns to match",
-                    value=False,
-                    help="If checked, both columns must individually meet the threshold"
-                )
+            # Create columns for weight sliders
+            weight_cols = st.columns(min(max_cols, 5))
+            weights = []
             
-            # Normalize weights
-            total_weight = weight_col1 + weight_col2
+            for i in range(max_cols):
+                with weight_cols[i % 5]:
+                    # Show which columns are being compared
+                    df1_col_name = df1_cols[i] if i < len(df1_cols) else "None"
+                    df2_col_name = df2_cols[i] if i < len(df2_cols) else "None"
+                    
+                    weight = st.slider(
+                        f"Pair {i+1}\n({df1_col_name} ↔ {df2_col_name})",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=1.0 / max_cols,
+                        step=0.05,
+                        key=f"weight{i}",
+                        help=f"Weight for comparing {df1_col_name} with {df2_col_name}"
+                    )
+                    weights.append(weight)
+            
+            # Normalize and display weights
+            total_weight = sum(weights)
             if total_weight > 0:
-                weight_col1_norm = weight_col1 / total_weight
-                weight_col2_norm = weight_col2 / total_weight
+                normalized_weights = [w / total_weight for w in weights]
+                weight_display = " | ".join([f"Pair{i+1}: {w:.1%}" for i, w in enumerate(normalized_weights)])
+                st.success(f"✓ Normalized weights: {weight_display}")
             else:
-                weight_col1_norm = 0.5
-                weight_col2_norm = 0.5
+                normalized_weights = [1.0 / max_cols] * max_cols
+                st.warning("⚠️ All weights are 0, using equal weights")
             
-            st.info(f"ℹ️ Normalized weights: Column 1 = {weight_col1_norm:.1%}, Column 2 = {weight_col2_norm:.1%}")
+            require_all = st.checkbox(
+                "Require all column pairs to match individually",
+                value=False,
+                help="If checked, all specified column pairs must individually meet the threshold"
+            )
             
             if st.button("🚀 Run Matching", type="primary"):
-                with st.spinner("Performing two-column fuzzy matching..."):
-                    results = st.session_state.matcher.fuzzy_match_two_columns(
+                with st.spinner(f"Performing multi-column fuzzy matching with {max_cols} column pair(s)..."):
+                    results = st.session_state.matcher.fuzzy_match_flexible_columns(
                         "Dataset_1",
                         "Dataset_2",
-                        df1_col1,
-                        df1_col2,
-                        df2_col1,
-                        df2_col2,
+                        df1_cols,
+                        df2_cols,
                         method=matching_method,
-                        weight_col1=weight_col1_norm,
-                        weight_col2=weight_col2_norm,
-                        require_both=require_both
+                        weights=weights,
+                        require_all=require_all
                     )
+                    
+                    # Store results in session state
+                    st.session_state.match_results = results
                     
                     if len(results) > 0:
                         st.success(f"✅ Found {len(results)} matches!")
                         
-                        # Display statistics
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("Total Matches", len(results))
-                        col2.metric("Avg Combined Score", f"{results['combined_score'].mean():.1f}%")
-                        col3.metric("Avg Col1 Score", f"{results[f'{df1_col1}_score'].mean():.1f}%")
-                        col4.metric("Avg Col2 Score", f"{results[f'{df1_col2}_score'].mean():.1f}%")
+                        # Display statistics - show combined score plus individual column scores
+                        num_stat_cols = min(max_cols + 1, 6)  # Combined + up to 5 column scores
+                        stat_cols = st.columns(num_stat_cols)
+                        
+                        stat_cols[0].metric("Total Matches", len(results))
+                        
+                        if 'combined_score' in results.columns:
+                            stat_cols[0].metric("Avg Combined", f"{results['combined_score'].mean():.1f}%")
+                        
+                        # Show average scores for each column pair
+                        col_idx = 1
+                        for i in range(1, max_cols + 1):
+                            if f'col{i}_score' in results.columns and col_idx < num_stat_cols:
+                                stat_cols[col_idx].metric(
+                                    f"Avg Pair{i}", 
+                                    f"{results[f'col{i}_score'].mean():.1f}%"
+                                )
+                                col_idx += 1
                         
                         # Display results
                         st.subheader("📊 Matching Results")
                         st.dataframe(results, use_container_width=True)
                         
-                        # Download button
-                        csv = results.to_csv(index=False)
-                        st.download_button(
-                            label="⬇️ Download Results as CSV",
-                            data=csv,
-                            file_name="fuzzy_match_two_column_results.csv",
-                            mime="text/csv"
-                        )
+                        # Download section
+                        st.subheader("⬇️ Download Options")
+                        
+                        download_cols = st.columns(3)
+                        
+                        with download_cols[0]:
+                            # Download matches only
+                            csv = results.to_csv(index=False)
+                            st.download_button(
+                                label="📄 Download Matches Only",
+                                data=csv,
+                                file_name="fuzzy_match_multi_column_results.csv",
+                                mime="text/csv",
+                                help="Download only the matched records"
+                            )
+                        
+                        with download_cols[1]:
+                            # Left Join - All Dataset 1 + Matches from Dataset 2
+                            left_join = st.session_state.matcher.create_left_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_left = left_join.to_csv(index=False)
+                            st.download_button(
+                                label="⬅️ Left Join (All Dataset 1)",
+                                data=csv_left,
+                                file_name="left_join_all_dataset1_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 1 with matching records from Dataset 2"
+                            )
+                        
+                        with download_cols[2]:
+                            # Right Join - All Dataset 2 + Matches from Dataset 1
+                            right_join = st.session_state.matcher.create_right_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_right = right_join.to_csv(index=False)
+                            st.download_button(
+                                label="➡️ Right Join (All Dataset 2)",
+                                data=csv_right,
+                                file_name="right_join_all_dataset2_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 2 with matching records from Dataset 1"
+                            )
                     else:
                         st.warning("⚠️ No matches found above the threshold. Try lowering the threshold or adjusting weights.")
         
@@ -629,6 +862,9 @@ def main():
                         combine_method=combine_method
                     )
                     
+                    # Store results in session state
+                    st.session_state.match_results = results
+                    
                     if len(results) > 0:
                         st.success(f"✅ Found {len(results)} matches!")
                         
@@ -642,14 +878,49 @@ def main():
                         st.subheader("📊 Matching Results")
                         st.dataframe(results, use_container_width=True)
                         
-                        # Download button
-                        csv = results.to_csv(index=False)
-                        st.download_button(
-                            label="⬇️ Download Results as CSV",
-                            data=csv,
-                            file_name="fuzzy_match_results.csv",
-                            mime="text/csv"
-                        )
+                        # Download section
+                        st.subheader("⬇️ Download Options")
+                        
+                        download_cols = st.columns(3)
+                        
+                        with download_cols[0]:
+                            # Download matches only
+                            csv = results.to_csv(index=False)
+                            st.download_button(
+                                label="📄 Download Matches Only",
+                                data=csv,
+                                file_name="fuzzy_match_results.csv",
+                                mime="text/csv",
+                                help="Download only the matched records"
+                            )
+                        
+                        with download_cols[1]:
+                            # Left Join - All Dataset 1 + Matches from Dataset 2
+                            left_join = st.session_state.matcher.create_left_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_left = left_join.to_csv(index=False)
+                            st.download_button(
+                                label="⬅️ Left Join (All Dataset 1)",
+                                data=csv_left,
+                                file_name="left_join_all_dataset1_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 1 with matching records from Dataset 2"
+                            )
+                        
+                        with download_cols[2]:
+                            # Right Join - All Dataset 2 + Matches from Dataset 1
+                            right_join = st.session_state.matcher.create_right_join(
+                                "Dataset_1", "Dataset_2", results
+                            )
+                            csv_right = right_join.to_csv(index=False)
+                            st.download_button(
+                                label="➡️ Right Join (All Dataset 2)",
+                                data=csv_right,
+                                file_name="right_join_all_dataset2_plus_matches.csv",
+                                mime="text/csv",
+                                help="All records from Dataset 2 with matching records from Dataset 1"
+                            )
                     else:
                         st.warning("⚠️ No matches found above the threshold. Try lowering the threshold.")
     
@@ -662,7 +933,8 @@ def main():
         "💡 **Tips:**\n"
         "- Start with 80% threshold\n"
         "- Use token_sort_ratio for most cases\n"
-        "- For two-column matching, weight the more unique column higher\n"
+        "- For multi-column matching, weight the most unique columns higher\n"
+        "- Each dataset can have 1-5 columns\n"
         "- Review matches manually\n"
         "- Adjust threshold if needed"
     )
